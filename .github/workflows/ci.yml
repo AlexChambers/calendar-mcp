@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: macos-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Swift
+      uses: swift-actions/setup-swift@v1
+      with:
+        swift-version: "5.9"
+    
+    - name: Build
+      run: swift build -v
+    
+    - name: Run tests
+      run: swift test -v
+    
+    - name: Build release
+      run: swift build -c release -v
+    
+    - name: Check binary size
+      run: |
+        ls -lh .build/release/calendar-mcp
+        echo "Binary size: $(du -h .build/release/calendar-mcp | cut -f1)"
+
+  lint:
+    runs-on: macos-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Swift
+      uses: swift-actions/setup-swift@v1
+      with:
+        swift-version: "5.9"
+    
+    - name: Swift Format Check
+      run: |
+        # Install swift-format if available, or skip for now
+        echo "Skipping swift-format check (not available)"
+        # swiftformat --lint Sources/ || true
+    
+    - name: Check for TODO/FIXME
+      run: |
+        if grep -r "TODO\|FIXME" Sources/; then
+          echo "⚠️  Found TODO/FIXME comments"
+        else
+          echo "✅ No TODO/FIXME comments found"
+        fi

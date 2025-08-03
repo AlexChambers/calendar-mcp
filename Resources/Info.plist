@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.alexchambers.calendar-mcp</string>
+    <key>CFBundleName</key>
+    <string>Calendar MCP Server</string>
+    <key>CFBundleVersion</key>
+    <string>1.0.0</string>
+    <key>NSCalendarsUsageDescription</key>
+    <string>Calendar MCP Server needs access to your calendars to provide calendar functionality to AI assistants.</string>
+    <key>NSCalendarsFullAccessUsageDescription</key>
+    <string>Calendar MCP Server needs full access to read and modify your calendar events.</string>
+    <key>com.apple.security.personal-information.calendars</key>
+    <true/>
+</dict>
+</plist>
