@@ -12,6 +12,7 @@ struct CalendarMCPServer {
 
 class Server {
     private let eventStore = EKEventStore()
+    private var messageCodec = StdioMessageCodec()
     
     init() {
         setbuf(stdout, nil)
@@ -19,23 +20,34 @@ class Server {
     }
     
     func run() async {
-        while let line = readLine() {
-            await handleLine(line)
+        while true {
+            guard let data = try? FileHandle.standardInput.read(upToCount: 4096),
+                  !data.isEmpty else {
+                break
+            }
+            
+            messageCodec.append(data)
+            while let messageData = messageCodec.nextMessage() {
+                await handleMessageData(messageData)
+            }
         }
     }
     
-    private func handleLine(_ line: String) async {
-        guard let data = line.data(using: .utf8) else { return }
-        
-        // Simple JSON parsing
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let method = json["method"] as? String,
-              let id = json["id"] else {
+    private func handleMessageData(_ data: Data) async {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            sendError(id: nil, code: -32700, message: "Parse error")
             return
         }
         
+        guard let method = json["method"] as? String else { return }
+        let id = json["id"]
+        
         switch method {
         case "initialize":
+            guard let id else {
+                sendError(id: nil, code: -32600, message: "Invalid Request: initialize requires id")
+                return
+            }
             let response: [String: Any] = [
                 "jsonrpc": "2.0",
                 "id": id,
@@ -57,6 +69,10 @@ class Server {
             log("Client initialized")
             
         case "tools/list":
+            guard let id else {
+                sendError(id: nil, code: -32600, message: "Invalid Request: tools/list requires id")
+                return
+            }
             let response: [String: Any] = [
                 "jsonrpc": "2.0",
                 "id": id,
@@ -173,6 +189,10 @@ class Server {
             sendJSON(response)
             
         case "tools/call":
+            guard let id else {
+                sendError(id: nil, code: -32600, message: "Invalid Request: tools/call requires id")
+                return
+            }
             if let params = json["params"] as? [String: Any],
                let toolName = params["name"] as? String {
                 
@@ -208,7 +228,7 @@ class Server {
                 ]
                 sendJSON(response)
             } else {
-                sendError(id: id, code: -32601, message: "Tool not found")
+                sendError(id: id, code: -32602, message: "Invalid params")
             }
             
         default:
@@ -269,7 +289,7 @@ class Server {
     private func checkCalendarAccess() async -> String? {
         let status = EKEventStore.authorizationStatus(for: .event)
         
-        if status != .authorized {
+        if !hasCalendarAccess(status) {
             if status == .notDetermined {
                 let granted = await requestAccess()
                 if !granted {
@@ -281,6 +301,14 @@ class Server {
         }
         
         return nil
+    }
+    
+    private func hasCalendarAccess(_ status: EKAuthorizationStatus) -> Bool {
+        if #available(macOS 14.0, *) {
+            return status == .fullAccess || status == .writeOnly || status == .authorized
+        }
+        
+        return status == .authorized
     }
     
     private func callListCalendars(_ arguments: [String: Any]) async -> String {
@@ -455,8 +483,8 @@ class Server {
         let calendarId = arguments["calendarId"] as? String
         
         // Parse dates
-        guard let startDate = parseDateTime(startDateStr, allDay: allDay),
-              let endDate = parseDateTime(endDateStr, allDay: allDay) else {
+        guard let startDate = parseDateTime(startDateStr, allDay: allDay, isEndDate: false),
+              let endDate = parseDateTime(endDateStr, allDay: allDay, isEndDate: true) else {
             return "Invalid date format. Use YYYY-MM-DD for all-day events or YYYY-MM-DD HH:MM for timed events"
         }
         
@@ -513,7 +541,7 @@ class Server {
         }
     }
     
-    private func parseDateTime(_ dateString: String, allDay: Bool) -> Date? {
+    private func parseDateTime(_ dateString: String, allDay: Bool, isEndDate: Bool = false) -> Date? {
         let dateFormatter = DateFormatter()
         
         if allDay {
@@ -527,9 +555,13 @@ class Server {
                 return date
             }
             
-            // Fall back to date only format and set time to start/end of day
+            // Fall back to date only format; for timed events infer day boundary.
             dateFormatter.dateFormat = "yyyy-MM-dd"
-            return dateFormatter.date(from: dateString)
+            guard let date = dateFormatter.date(from: dateString) else { return nil }
+            if isEndDate {
+                return Calendar.current.date(bySettingHour: 23, minute: 59, second: 59, of: date)
+            }
+            return Calendar.current.date(bySettingHour: 0, minute: 0, second: 0, of: date)
         }
     }
     
@@ -680,7 +712,7 @@ class Server {
                 hasChanges = true
             }
             
-            if let startDate = parseDateTime(startDateStr, allDay: event.isAllDay) {
+            if let startDate = parseDateTime(startDateStr, allDay: event.isAllDay, isEndDate: false) {
                 event.startDate = startDate
                 hasChanges = true
             } else {
@@ -689,7 +721,7 @@ class Server {
         }
         
         if let endDateStr = arguments["endDate"] as? String {
-            if let endDate = parseDateTime(endDateStr, allDay: event.isAllDay) {
+            if let endDate = parseDateTime(endDateStr, allDay: event.isAllDay, isEndDate: true) {
                 event.endDate = endDate
                 hasChanges = true
             } else {
@@ -884,17 +916,20 @@ class Server {
     }
     
     private func sendJSON(_ object: [String: Any]) {
-        if let data = try? JSONSerialization.data(withJSONObject: object),
-           let jsonString = String(data: data, encoding: .utf8) {
-            print(jsonString)
-            fflush(stdout)
-        }
+        guard let data = try? JSONSerialization.data(withJSONObject: object) else { return }
+        
+        let header = "Content-Length: \(data.count)\r\n\r\n"
+        guard let headerData = header.data(using: .utf8) else { return }
+        
+        FileHandle.standardOutput.write(headerData)
+        FileHandle.standardOutput.write(data)
+        fflush(stdout)
     }
     
-    private func sendError(id: Any, code: Int, message: String) {
+    private func sendError(id: Any?, code: Int, message: String) {
         let response: [String: Any] = [
             "jsonrpc": "2.0",
-            "id": id,
+            "id": id ?? NSNull(),
             "error": ["code": code, "message": message]
         ]
         sendJSON(response)
@@ -903,5 +938,115 @@ class Server {
     private func log(_ message: String) {
         fputs("[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n", stderr)
         fflush(stderr)
+    }
+}
+
+struct StdioMessageCodec {
+    private var buffer = Data()
+    
+    mutating func append(_ data: Data) {
+        buffer.append(data)
+    }
+    
+    mutating func nextMessage() -> Data? {
+        while true {
+            trimLeadingLineBreaks()
+            
+            if let message = nextFramedMessage() {
+                return message
+            }
+            if discardInvalidFramedHeaderIfPresent() {
+                continue
+            }
+            if startsWithContentLengthHeader() {
+                return nil
+            }
+            
+            let remainingBytes = buffer.count
+            if let message = nextLineMessage() {
+                return message
+            }
+            if buffer.count < remainingBytes {
+                continue
+            }
+            
+            return nil
+        }
+    }
+    
+    private mutating func nextFramedMessage() -> Data? {
+        guard startsWithContentLengthHeader(),
+              let headerRange = buffer.range(of: Data("\r\n\r\n".utf8)),
+              let headerString = String(data: buffer[..<headerRange.lowerBound], encoding: .utf8),
+              let contentLength = parseContentLength(from: headerString) else {
+            return nil
+        }
+        
+        let bodyStart = headerRange.upperBound
+        guard buffer.count >= bodyStart + contentLength else { return nil }
+        
+        let message = Data(buffer[bodyStart..<(bodyStart + contentLength)])
+        buffer.removeSubrange(0..<(bodyStart + contentLength))
+        return message
+    }
+    
+    private mutating func nextLineMessage() -> Data? {
+        guard let newlineIndex = buffer.firstIndex(of: 0x0A) else { return nil }
+        
+        var line = Data(buffer[..<newlineIndex])
+        buffer.removeSubrange(0...newlineIndex)
+        
+        while line.last == 0x0D {
+            line.removeLast()
+        }
+        
+        let trimmed = String(data: line, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if trimmed.isEmpty {
+            return nil
+        }
+        
+        return Data(trimmed.utf8)
+    }
+    
+    private mutating func trimLeadingLineBreaks() {
+        while let first = buffer.first, first == 0x0A || first == 0x0D {
+            buffer.removeFirst()
+        }
+    }
+    
+    private func startsWithContentLengthHeader() -> Bool {
+        guard buffer.count >= 15 else { return false }
+        let prefix = Data(buffer.prefix(15))
+        guard let prefixString = String(data: prefix, encoding: .utf8) else { return false }
+        return prefixString.lowercased() == "content-length:"
+    }
+    
+    private func parseContentLength(from header: String) -> Int? {
+        for line in header.components(separatedBy: "\r\n") {
+            let parts = line.split(separator: ":", maxSplits: 1).map(String.init)
+            guard parts.count == 2 else { continue }
+            
+            if parts[0].trimmingCharacters(in: .whitespaces).lowercased() == "content-length" {
+                guard let value = Int(parts[1].trimmingCharacters(in: .whitespaces)),
+                      value >= 0 else {
+                    return nil
+                }
+                return value
+            }
+        }
+        return nil
+    }
+    
+    private mutating func discardInvalidFramedHeaderIfPresent() -> Bool {
+        guard startsWithContentLengthHeader(),
+              let headerRange = buffer.range(of: Data("\r\n\r\n".utf8)),
+              let headerString = String(data: buffer[..<headerRange.lowerBound], encoding: .utf8),
+              parseContentLength(from: headerString) == nil else {
+            return false
+        }
+        
+        buffer.removeSubrange(0..<headerRange.upperBound)
+        return true
     }
 }
