@@ -20,12 +20,16 @@ class Server {
     }
     
     func run() async {
+        let fd = FileHandle.standardInput.fileDescriptor
+        let bufferSize = 4096
+        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
+        defer { buffer.deallocate() }
+
         while true {
-            guard let data = try? FileHandle.standardInput.read(upToCount: 4096),
-                  !data.isEmpty else {
-                break
-            }
-            
+            let bytesRead = Darwin.read(fd, buffer, bufferSize)
+            guard bytesRead > 0 else { break }
+
+            let data = Data(bytes: buffer, count: bytesRead)
             messageCodec.append(data)
             while let messageData = messageCodec.nextMessage() {
                 await handleMessageData(messageData)
@@ -916,14 +920,9 @@ class Server {
     }
     
     private func sendJSON(_ object: [String: Any]) {
-        guard let data = try? JSONSerialization.data(withJSONObject: object) else { return }
-        
-        let header = "Content-Length: \(data.count)\r\n\r\n"
-        guard let headerData = header.data(using: .utf8) else { return }
-        
-        FileHandle.standardOutput.write(headerData)
+        guard var data = try? JSONSerialization.data(withJSONObject: object) else { return }
+        data.append(0x0A) // newline
         FileHandle.standardOutput.write(data)
-        fflush(stdout)
     }
     
     private func sendError(id: Any?, code: Int, message: String) {
