@@ -18,6 +18,7 @@ A pure Swift implementation of a Model Context Protocol (MCP) server that provid
 - `calendar_update_event` - Update existing events  
 - `calendar_delete_event` - Delete events
 - `calendar_search_events` - Search for events by title, notes, or location
+- `calendar_find_free_time` - Find free slots of a given length within working hours across calendars
 
 ### Calendar Management
 - `calendar_list_calendars` - List all available calendars with details
@@ -114,6 +115,11 @@ Once installed, you can ask Claude to:
 - "Create a daily recurring meeting at 9am for the next 10 days"
 - "Schedule a weekly team meeting every Monday at 2pm"
 - "Set up a monthly bill reminder on the 1st of each month"
+
+### Finding Time
+- "When am I free for an hour next week?"
+- "Find a 30-minute slot on Thursday between 10:00 and 16:00"
+- "Find two hours this week, keeping 15 minutes free around my other meetings"
 
 ### Managing Events
 - "Update the meeting title to 'Daily Standup'"

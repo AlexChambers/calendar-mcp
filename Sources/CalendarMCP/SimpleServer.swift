@@ -170,6 +170,25 @@ class Server {
                             ]
                         ],
                         [
+                            "name": "calendar_find_free_time",
+                            "description": "Find free time slots across calendars within working hours. Ignores events marked 'free', declined/cancelled events, and all-day events unless marked busy. Birthday and subscribed calendars are skipped unless listed in calendarIds.",
+                            "inputSchema": [
+                                "type": "object",
+                                "properties": [
+                                    "startDate": ["type": "string", "description": "First day to search (YYYY-MM-DD)"],
+                                    "endDate": ["type": "string", "description": "Last day to search (YYYY-MM-DD)"],
+                                    "durationMinutes": ["type": "integer", "description": "Minimum slot length in minutes (default 60)"],
+                                    "workdayStart": ["type": "string", "description": "Start of working hours HH:MM (default 09:00)"],
+                                    "workdayEnd": ["type": "string", "description": "End of working hours HH:MM (default 18:00)"],
+                                    "includeWeekends": ["type": "boolean", "description": "Include Saturdays and Sundays (default false)"],
+                                    "bufferMinutes": ["type": "integer", "description": "Keep this many minutes free before and after existing events (default 0)"],
+                                    "calendarIds": ["type": "array", "items": ["type": "string"], "description": "Only treat these calendars as busy (optional; default all except birthdays/subscriptions)"],
+                                    "maxSlots": ["type": "integer", "description": "Maximum number of slots to return (default 30)"]
+                                ],
+                                "required": ["startDate", "endDate"]
+                            ]
+                        ],
+                        [
                             "name": "calendar_search_events",
                             "description": "Search for events by title or content",
                             "inputSchema": [
@@ -212,6 +231,8 @@ class Server {
                     result = await callUpdateEvent(arguments)
                 case "calendar_delete_event":
                     result = await callDeleteEvent(arguments)
+                case "calendar_find_free_time":
+                    result = await callFindFreeTime(arguments)
                 case "calendar_search_events":
                     result = await callSearchEvents(arguments)
                 default:
@@ -896,6 +917,105 @@ class Server {
         return result
     }
     
+    private func callFindFreeTime(_ arguments: [String: Any]) async -> String {
+        if let accessError = await checkCalendarAccess() {
+            return accessError
+        }
+
+        let dayFormatter = DateFormatter()
+        dayFormatter.dateFormat = "yyyy-MM-dd"
+        guard let startStr = arguments["startDate"] as? String, let endStr = arguments["endDate"] as? String,
+              let startDay = dayFormatter.date(from: startStr), let endDay = dayFormatter.date(from: endStr) else {
+            return "startDate and endDate are required (YYYY-MM-DD)"
+        }
+        let duration = TimeInterval(max(5, (arguments["durationMinutes"] as? Int) ?? 60) * 60)
+        let buffer = TimeInterval(max(0, (arguments["bufferMinutes"] as? Int) ?? 0) * 60)
+        let includeWeekends = arguments["includeWeekends"] as? Bool ?? false
+        let maxSlots = max(1, (arguments["maxSlots"] as? Int) ?? 30)
+
+        func hm(_ value: String?, _ fallback: (Int, Int)) -> (Int, Int) {
+            guard let parts = value?.split(separator: ":").compactMap({ Int($0) }), parts.count == 2 else { return fallback }
+            return (parts[0], parts[1])
+        }
+        let (startH, startM) = hm(arguments["workdayStart"] as? String, (9, 0))
+        let (endH, endM) = hm(arguments["workdayEnd"] as? String, (18, 0))
+
+        let calendars: [EKCalendar]
+        if let ids = arguments["calendarIds"] as? [String], !ids.isEmpty {
+            calendars = ids.compactMap { eventStore.calendar(withIdentifier: $0) }
+            if calendars.isEmpty { return "None of the given calendarIds were found" }
+        } else {
+            calendars = eventStore.calendars(for: .event).filter { $0.type != .birthday && $0.type != .subscription }
+        }
+
+        let cal = Calendar.current
+        guard let rangeEnd = cal.date(byAdding: .day, value: 1, to: endDay), rangeEnd > startDay else {
+            return "endDate must be on or after startDate"
+        }
+        let events = eventStore.events(matching: eventStore.predicateForEvents(withStart: startDay, end: rangeEnd, calendars: calendars))
+
+        // Busy intervals (with buffer), merged.
+        var busy: [(Date, Date)] = events.compactMap { ev in
+            guard let s = ev.startDate, let e = ev.endDate else { return nil }
+            if ev.status == .canceled || ev.availability == .free { return nil }
+            if ev.isAllDay && ev.availability != .busy { return nil }
+            if let me = ev.attendees?.first(where: { $0.isCurrentUser }), me.participantStatus == .declined { return nil }
+            return (s.addingTimeInterval(-buffer), e.addingTimeInterval(buffer))
+        }.sorted { $0.0 < $1.0 }
+        var merged: [(Date, Date)] = []
+        for b in busy {
+            if let last = merged.last, b.0 <= last.1 {
+                merged[merged.count - 1].1 = max(last.1, b.1)
+            } else {
+                merged.append(b)
+            }
+        }
+        busy = merged
+
+        // Never suggest the past: round "now" up to the next quarter hour.
+        let nowRounded: Date = {
+            let now = Date()
+            let minute = cal.component(.minute, from: now)
+            let add = (15 - minute % 15) % 15
+            return cal.date(bySetting: .second, value: 0, of: cal.date(byAdding: .minute, value: add == 0 ? 15 : add, to: now) ?? now) ?? now
+        }()
+
+        let timeFmt = DateFormatter()
+        timeFmt.dateFormat = "HH:mm"
+        let dayFmt = DateFormatter()
+        dayFmt.dateFormat = "EEE yyyy-MM-dd"
+
+        var slots: [(Date, Date)] = []
+        var day = startDay
+        while day < rangeEnd && slots.count < maxSlots {
+            defer { day = cal.date(byAdding: .day, value: 1, to: day) ?? rangeEnd }
+            if !includeWeekends && cal.isDateInWeekend(day) { continue }
+            guard let ws = cal.date(bySettingHour: startH, minute: startM, second: 0, of: day),
+                  let we = cal.date(bySettingHour: endH, minute: endM, second: 0, of: day), we > ws else { continue }
+            var cursor = max(ws, nowRounded)
+            for b in busy where b.1 > cursor && b.0 < we {
+                if b.0.timeIntervalSince(cursor) >= duration { slots.append((cursor, b.0)) }
+                cursor = max(cursor, b.1)
+            }
+            if we.timeIntervalSince(cursor) >= duration { slots.append((cursor, we)) }
+        }
+        slots = Array(slots.prefix(maxSlots))
+
+        if slots.isEmpty {
+            return "No free slots of at least \(Int(duration / 60)) minutes between \(startStr) and \(endStr) within \(String(format: "%02d:%02d", startH, startM))–\(String(format: "%02d:%02d", endH, endM))."
+        }
+        var result = "Free slots of at least \(Int(duration / 60)) min (\(String(format: "%02d:%02d", startH, startM))–\(String(format: "%02d:%02d", endH, endM)), checked \(calendars.count) calendar(s)):\n"
+        var lastDay = ""
+        for (s, e) in slots {
+            let d = dayFmt.string(from: s)
+            if d != lastDay { result += "\n\(d)\n"; lastDay = d }
+            let mins = Int(e.timeIntervalSince(s) / 60)
+            let length = mins >= 60 ? "\(mins / 60)h\(mins % 60 > 0 ? " \(mins % 60)m" : "")" : "\(mins)m"
+            result += "  • \(timeFmt.string(from: s))–\(timeFmt.string(from: e))  (\(length))\n"
+        }
+        return result
+    }
+
     private func requestAccess() async -> Bool {
         if #available(macOS 14.0, *) {
             return (try? await eventStore.requestFullAccessToEvents()) ?? false
